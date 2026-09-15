@@ -70,11 +70,11 @@ def setup_gpu():
 
     scene.render.resolution_x = RESOLUTION[0]
     scene.render.resolution_y = RESOLUTION[1]
-    scene.render.resolution_perecentage = 100
+    scene.render.resolution_percentage = 100
 
     layer = scene.view_layers[0]
     layer.use_pass_combined = True
-    layer._use_pass_position = True
+    layer.use_pass_position = True
     layer.use_pass_object_index = True
     layer.use_pass_z = True
 
@@ -97,19 +97,19 @@ def setup_gpu():
         png.inputs["frame_"]
     )
 
-exr = nodes.new("CompositorNodeOutputFile")
-exr.base_path = EXR
-exr.format.file_format = "OPEN_EXR_MULTILAYER"
-exr.format.color_depth = "32"
+    exr = nodes.new("CompositorNodeOutputFile")
+    exr.base_path = EXR
+    exr.format.file_format = "OPEN_EXR_MULTILAYER"
+    exr.format.color_depth = "32"
 
-for name in ("Image", "Position", "IndexOB", "Depth"):
-    if name in render_layers.outputs:
-        slot = "Combined" if name == "Image" else name
-        exr.layer_slots.new(slot)
-        links.new(
-            render_layers.outputs[name],
-            exr.inputs[slot]
-        )
+    for name in ("Image", "Position", "IndexOB", "Depth"):
+        if name in render_layers.outputs:
+            slot = "Combined" if name == "Image" else name
+            exr.layer_slots.new(slot)
+            links.new(
+                render_layers.outputs[name],
+                exr.inputs[slot]
+            )
 
 
 
@@ -126,9 +126,12 @@ def store_camera_locations():
     #Random jitter
     jitter = 1  # Maximum random jitter in meters
 
+    M = Terrain.matrix_world
+    M_inv = M.inverted()
+
     for circle in range(num_circles):
-        radius = circle_distances[circle] + np.random.uniform(-jitter, jitter)  # Add random jitter to the radius
         for azimuth in range(num_locations_per_circle):
+            radius = circle_distances[circle] + random.uniform(-jitter, jitter)  # Add random jitter to the radius
             angle = (azimuth / num_locations_per_circle) * 360.0
             x = Lander.location.x + radius * math.cos(math.radians(angle))
             y = Lander.location.y + radius * math.sin(math.radians(angle))
@@ -141,7 +144,6 @@ def store_camera_locations():
                 location = M @ location  # Transform back to world coordinates
                 z = location.z + CAMERA_HEIGHT  # Set Z to CAMERA_HEIGHT above the terrain
 
-                camera_locations.append((x, y, z, angle))
 
             else:
                 print(f"Skipped circle_{circle}_location_{azimuth}: No terrain found beneath it.")
