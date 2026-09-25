@@ -1,6 +1,3 @@
-
-from trimesh import Scene
-
 import bpy
 import csv
 import math
@@ -18,11 +15,12 @@ Terrain = bpy.data.objects['Moon_Terrain']
 Lander = bpy.data.objects['LAND_Base']
 
 #Paths for saved frames
-OUT = bpy.path.abspath("//../render_output/") 
+OUT = bpy.path.abspath("//render_output/") 
 RGB = os.path.join(OUT, "RGB")
 EXR = os.path.join(OUT, "EXR")
 
-RESOLUTION = (1280, 960)
+RESOLUTION_X = 1280
+RESOLUTION_Y = 960
 
 
 
@@ -54,61 +52,69 @@ def setup_gpu():
     scene.render.engine = 'CYCLES'
 
     prefs = bpy.context.preferences.addons["cycles"].preferences
-    prefs.compute_device_type = "OPTIX"
+    prefs.compute_device_type = "METAL"
     prefs.get_devices()
 
     for d in prefs.devices:
-        d.use = d.type =="OPTIX"
+        d.use = d.type =="METAL"
 
     scene.cycles.device = "GPU"
-    scene.render.use_persistent_data = True
+    scene.render.use_persistent_data = False
     scene.cycles.samples = 64
     scene.cycles.use_adaptive_sampling = True
     scene.cycles.adaptive_threshold = 0.01
     scene.cycles.use_denoising = True
-    scene.cycles.denoiser = "OPTIX"
+    scene.cycles.denoiser = "OPENIMAGEDENOISE"
 
-    scene.render.resolution_x = RESOLUTION[0]
-    scene.render.resolution_y = RESOLUTION[1]
+    scene.render.resolution_x = RESOLUTION_X
+    scene.render.resolution_y = RESOLUTION_Y
     scene.render.resolution_percentage = 100
 
-    layer = scene.view_layers[0]
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGB"
+
+    layer = bpy.context.view_layer
     layer.use_pass_combined = True
     layer.use_pass_position = True
     layer.use_pass_object_index = True
     layer.use_pass_z = True
 
-    scene.use_nodes = True
+    node_tree = bpy.data.node_groups.new("Lunar_PnP_Compositor", "CompositorNodeTree")
+    scene.compositing_node_group = node_tree    
 
-    nodes = scene.node_tree.nodes
-    links = scene.node_tree.links
+    nodes = node_tree.nodes
+    links = node_tree.links
     nodes.clear()
 
     render_layers = nodes.new("CompositorNodeRLayers")
 
-    png = nodes.new("CompositorNodeOutputFile")
-    png.base_path = RGB
-    png.format.file_format = "PNG"
-    png.format.color_mode = "RGB" 
-    png.file_slots.new("frame_")
+    # png = nodes.new("CompositorNodeOutputFile")
+    # png.base_path = RGB
+    # png.format.file_format = "PNG"
+    # png.format.color_mode = "RGB" 
+    # png.file_slots.new("frame_")
 
-    links.new(
-        render_layers.outputs["Image"],
-        png.inputs["frame_"]
-    )
+    # links.new(
+    #     render_layers.outputs["Image"],
+    #     png.inputs["frame_"]
+    # )
 
     exr = nodes.new("CompositorNodeOutputFile")
-    exr.base_path = EXR
+    exr.name = "EXR_Output_Node"
+    exr.directory = EXR
+    exr.file_name = "data_"
     exr.format.file_format = "OPEN_EXR_MULTILAYER"
     exr.format.color_depth = "32"
 
-    for name in ("Image", "Position", "IndexOB", "Depth"):
+    for i, name in enumerate(("Image", "Position", "IndexOB", "Depth")):
         if name in render_layers.outputs:
             slot = "Combined" if name == "Image" else name
-            exr.layer_slots.new(slot)
+            socket_type = 'RGBA' if name in ("Image", "Position") else 'FLOAT'
+
+            exr.file_output_items.new(socket_type, slot)
             links.new(
                 render_layers.outputs[name],
-                exr.inputs[slot]
+                exr.inputs[i]
             )
 
 
@@ -139,10 +145,11 @@ def store_camera_locations():
             ray_start_world = M_inv @ Vector((x, y, 200))  # Start the ray above the terrain
             ray_dir_world = M_inv.to_3x3() @ Vector((0, 0, -1)).normalized()  # Cast the ray downwards
 
-            hit, location, normal, index, object, matrix = Terrain.ray_cast(ray_start_world, ray_dir_world)
+            hit, location, normal, index = Terrain.ray_cast(ray_start_world, ray_dir_world)
             if hit:
                 location = M @ location  # Transform back to world coordinates
                 z = location.z + CAMERA_HEIGHT  # Set Z to CAMERA_HEIGHT above the terrain
+                camera_locations.append((x, y, z, angle))
 
 
             else:
@@ -152,7 +159,7 @@ def store_camera_locations():
 
 
 
-            camera_locations.append((x, y, z, angle))
+            
 
     return camera_locations
 
@@ -178,6 +185,11 @@ def main():
 
     poses_path = os.path.join(OUT, "posev.csv")
 
+    node_tree = scene.compositing_node_group
+    exr_node = node_tree.nodes["EXR_Output_Node"]
+
+    scene.render.use_file_extension = False
+
     with open(poses_path, "w", newline="") as f:
 
         writer = csv.writer(f)
@@ -201,7 +213,11 @@ def main():
 
             scene.frame_set(frame)
 
-            bpy.ops.render.render(write_still=False)
+            scene.render.filepath = os.path.join(RGB, f"frame_{frame:04d}.png")
+
+            exr_node.file_name = f"frame_{frame:04d}.exr"
+
+            bpy.ops.render.render(write_still=True)
 
             q = Camera.matrix_world.to_quaternion()
 
@@ -222,6 +238,8 @@ def main():
             ])
 
             f.flush()
+
+            bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
 
 
 if __name__ == "__main__":
