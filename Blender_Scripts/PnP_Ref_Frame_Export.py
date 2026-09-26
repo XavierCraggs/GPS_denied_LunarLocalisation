@@ -182,7 +182,6 @@ def store_camera_locations():
 
             else:
                 print(f"Skipped circle_{circle}_location_{azimuth}: No terrain found beneath it.")
-                z = CAMERA_HEIGHT  # Default to CAMERA_HEIGHT if no terrain is found
                 continue 
 
     return camera_locations
