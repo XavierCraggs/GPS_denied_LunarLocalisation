@@ -9,15 +9,18 @@ import shutil
 
 
 ## Constants
+MODE = 'TESTING'  # Options: 'TRAINING' or 'TESTING'
+NUM_TEST_FRAMES = 10  # Number of test frames to generate if in testing MODE
 CAMERA_HEIGHT = 1.0  # Height of the camera above the terrain
 Camera = bpy.data.objects['Rover_Camera']  
 Terrain = bpy.data.objects['Moon_Terrain']  
 Lander = bpy.data.objects['LAND_Base']
 
-#Paths for saved frames
-OUT = bpy.path.abspath("//render_output/") 
-RGB = os.path.join(OUT, "RGB")
-EXR = os.path.join(OUT, "EXR")
+#Paths for saved training frames
+DIR = bpy.path.abspath("//render_output/") 
+MODE_DIR = os.path.join(DIR, MODE)
+RGB = os.path.join(MODE_DIR, "RGB")
+EXR = os.path.join(MODE_DIR, "EXR")
 
 RESOLUTION_X = 1280
 RESOLUTION_Y = 960
@@ -123,43 +126,64 @@ def setup_gpu():
 def store_camera_locations():
     camera_locations = []
 
-    #Number of concentric circles
-    num_circles = 3
-    #Number of camera locations per circle
-    num_locations_per_circle = 24
+    M = Terrain.matrix_world
+    M_inv = M.inverted()
+    
+
     #Distance between each circle
     circle_distances = [8.0, 15.0, 22.0]  # Distances for each circle
     #Random jitter
     jitter = 1  # Maximum random jitter in meters
 
-    M = Terrain.matrix_world
-    M_inv = M.inverted()
+    min_dist = circle_distances[0] -jitter
+    max_dist = circle_distances[-1] + jitter
 
-    for circle in range(num_circles):
-        for azimuth in range(num_locations_per_circle):
-            radius = circle_distances[circle] + random.uniform(-jitter, jitter)  # Add random jitter to the radius
-            angle = (azimuth / num_locations_per_circle) * 360.0
+    if MODE == "TRAINING":
+        num_circles = 3
+        num_locations_per_circle = 24
+
+        for circle in range(num_circles):
+            for azimuth in range(num_locations_per_circle):
+                radius = circle_distances[circle] + random.uniform(-jitter, jitter)  # Add random jitter to the radius
+                angle = (azimuth / num_locations_per_circle) * 360.0
+                x = Lander.location.x + radius * math.cos(math.radians(angle))
+                y = Lander.location.y + radius * math.sin(math.radians(angle))
+                # Z coordinate set to CAMERA_HEIGHT above the "Moon_Terrain" at the current XY
+                ray_start_world = M_inv @ Vector((x, y, 200))  # Start the ray above the terrain
+                ray_dir_world = M_inv.to_3x3() @ Vector((0, 0, -1)).normalized()  # Cast the ray downwards
+                hit, location, normal, index = Terrain.ray_cast(ray_start_world, ray_dir_world)
+
+                if hit:
+                    location = M @ location  # Transform back to world coordinates
+                    z = location.z + CAMERA_HEIGHT  # Set Z to CAMERA_HEIGHT above the terrain
+                    camera_locations.append((x, y, z, angle))
+
+                else:
+                    print(f"Skipped circle_{circle}_location_{azimuth}: No terrain found beneath it.")
+                    z = CAMERA_HEIGHT  # Default to CAMERA_HEIGHT if no terrain is found
+                    continue
+
+    elif MODE == "TESTING":
+        for i in range(NUM_TEST_FRAMES):
+            radius = random.uniform(min_dist, max_dist)
+            angle = random.uniform(0, 360)
+
             x = Lander.location.x + radius * math.cos(math.radians(angle))
             y = Lander.location.y + radius * math.sin(math.radians(angle))
-            # Z coordinate set to CAMERA_HEIGHT above the "Moon_Terrain" at the current XY
+
             ray_start_world = M_inv @ Vector((x, y, 200))  # Start the ray above the terrain
             ray_dir_world = M_inv.to_3x3() @ Vector((0, 0, -1)).normalized()  # Cast the ray downwards
-
             hit, location, normal, index = Terrain.ray_cast(ray_start_world, ray_dir_world)
+
             if hit:
                 location = M @ location  # Transform back to world coordinates
                 z = location.z + CAMERA_HEIGHT  # Set Z to CAMERA_HEIGHT above the terrain
                 camera_locations.append((x, y, z, angle))
 
-
             else:
                 print(f"Skipped circle_{circle}_location_{azimuth}: No terrain found beneath it.")
                 z = CAMERA_HEIGHT  # Default to CAMERA_HEIGHT if no terrain is found
-                continue
-
-
-
-            
+                continue 
 
     return camera_locations
 
@@ -172,8 +196,8 @@ def main():
 
     scene = bpy.context.scene
 
-    if os.path.isdir(OUT):
-        shutil.rmtree(OUT)
+    if os.path.isdir(MODE_DIR):
+        shutil.rmtree(MODE_DIR)
 
     os.makedirs(RGB)
     os.makedirs(EXR)
@@ -183,7 +207,7 @@ def main():
 
     camera_locations = store_camera_locations()
 
-    poses_path = os.path.join(OUT, "posev.csv")
+    poses_path = os.path.join(MODE_DIR, f"posev_{MODE.lower()}.csv")
 
     node_tree = scene.compositing_node_group
     exr_node = node_tree.nodes["EXR_Output_Node"]
