@@ -5,13 +5,14 @@ from mathutils import Vector
 import os
 import random
 import shutil
+import sys
 
 
 
 ## Constants
 MODE = 'TESTING'  # Options: 'TRAINING' or 'TESTING'
 NUM_TEST_FRAMES = 10  # Number of test frames to generate if in testing MODE
-CAMERA_HEIGHT = 1.0  # Height of the camera above the terrain
+CAMERA_HEIGHT = 1.5  # Height of the camera above the terrain
 Camera = bpy.data.objects['Rover_Camera']  
 Terrain = bpy.data.objects['Moon_Terrain']  
 Lander = bpy.data.objects['LAND_Base']
@@ -55,14 +56,16 @@ def setup_gpu():
     scene.render.engine = 'CYCLES'
 
     prefs = bpy.context.preferences.addons["cycles"].preferences
-    prefs.compute_device_type = "METAL"
+    backend = "METAL" if sys.platform == "darwin" else "OPTIX"
+    prefs.compute_device_type = backend
     prefs.get_devices()
 
     for d in prefs.devices:
-        d.use = d.type =="METAL"
+        d.use = d.type ==backend
+        print("Render devices:", [(d.name, d.type, d.use) for d in prefs.devices])
 
     scene.cycles.device = "GPU"
-    scene.render.use_persistent_data = False
+    scene.render.use_persistent_data = True
     scene.cycles.samples = 64
     scene.cycles.use_adaptive_sampling = True
     scene.cycles.adaptive_threshold = 0.01
@@ -109,16 +112,22 @@ def setup_gpu():
     exr.format.file_format = "OPEN_EXR_MULTILAYER"
     exr.format.color_depth = "32"
 
-    for i, name in enumerate(("Image", "Position", "IndexOB", "Depth")):
-        if name in render_layers.outputs:
-            slot = "Combined" if name == "Image" else name
-            socket_type = 'RGBA' if name in ("Image", "Position") else 'FLOAT'
+    passes = {
+        "Position":     ("Position", 'RGBA'),
+        "Object Index": ("IndexOB",  'FLOAT'),
+    }
 
-            exr.file_output_items.new(socket_type, slot)
-            links.new(
-                render_layers.outputs[name],
-                exr.inputs[i]
-            )
+    for socket_name, (name, socket_type) in passes.items():
+        if socket_name not in render_layers.outputs:
+            print(f"WARNING: Render Layers has no '{socket_name}' output. "
+                  f"Available: {[o.name for o in render_layers.outputs]}")
+            continue
+
+        exr.file_output_items.new(socket_type, name)
+        links.new(
+            render_layers.outputs[socket_name],
+            exr.inputs[name]
+)
 
 
 

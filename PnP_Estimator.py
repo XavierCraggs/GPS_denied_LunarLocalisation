@@ -9,14 +9,14 @@ import re
 from pathlib import Path
 
 ##setup
-ROOT = Path("/Users/xaviercraggs/Library/CloudStorage/OneDrive-Personal/QUT/Thesis/render_output")
+ROOT = Path(__file__).resolve().parent.parent / "render_output"
 REF_DIR = ROOT / "TRAINING"
 TEST_DIR = ROOT / "TESTING"
 INTRINSICS_PATH = Path(__file__).parent / "Project_Intrinsics" / "Camera_details.json"
 
 LANDER_INDEX = 1 
 LIGHTGLUE_THRESHOLD = 0.2
-LIGHTGLUE_BATCH = 8
+LIGHTGLUE_BATCH = 4
 
 def load_intrinsics(json_path):
     with open(json_path) as f:
@@ -31,7 +31,9 @@ def load_intrinsics(json_path):
 def decompose_EXR(exr_path):
     # Load the exr file
     with OpenEXR.File(str(exr_path)) as exr_file:
-        channels = exr_file.parts[0].channels
+        channels = {}
+        for part in exr_file.parts:
+            channels.update(part.channels)
 
         position_map = channels["Position"].pixels[..., :3].astype(np.float64) 
         object_index_map = channels["IndexOB.V"].pixels.astype(np.int32)
@@ -156,7 +158,12 @@ def main():
     akaze = cv2.AKAZE_create()
 
     processor = AutoImageProcessor.from_pretrained("ETH-CVG/lightglue_superpoint")
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     model = AutoModel.from_pretrained("ETH-CVG/lightglue_superpoint").to(device)
     model.eval()
 
