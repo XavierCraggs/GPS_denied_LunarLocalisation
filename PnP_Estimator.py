@@ -10,6 +10,7 @@ import argparse
 import shutil
 import csv
 import time
+import pandas as pd
 
 ##setup
 ROOT = Path(__file__).resolve().parent.parent / "render_output"
@@ -30,6 +31,11 @@ PNP_ITERATIONS = 1000
 PNP_CONFIDENCE = 0.999
 MIN_CORRESPONDENCES = 6     # minimum 2D-3D pairs to attempt PnP
 MIN_INLIERS = 10            # minimum RANSAC inliers to accept a pose
+
+POS_MAX_ERR = 0.5   # Maximuim position and rotation error
+ROT_MAX_ERR = 5.0
+
+CLUSTER_M = 1.0 # Poses within distance are seen as agreeing
 
 R_BCAM2CV = np.diag([1.0, -1.0, -1.0])   # Blender camera axes -> OpenCV camera axes
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
@@ -85,7 +91,7 @@ def decompose_EXR(exr_path):
 def frame_number(path):
     return int(re.findall(r"\d+", Path(path).stem)[-1])
 
-def build_reference_db(ref_dir, orb, akaze):
+def build_reference_db(ref_dir, orb, akaze, processor, model):
     rgb_paths = {frame_number(p): p for p in (ref_dir / "RGB").glob("*.png")}
     exr_paths = {frame_number(p): p for p in (ref_dir / "EXR").glob("*.exr")}
 
@@ -109,14 +115,16 @@ def build_reference_db(ref_dir, orb, akaze):
         # Segment the lander
         lander_mask = (object_index_map == LANDER_INDEX).astype(np.uint8) * 255
 
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         reference_db.append({
             "frame": frame,
-            "image_rgb": cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
+            "image_rgb": image_rgb,
             "lander_mask": lander_mask,
             "position_map": position_map,
             "object_index_map": object_index_map,
             "orb": orb.detectAndCompute(gray, lander_mask),
             "akaze": akaze.detectAndCompute(gray, lander_mask),
+            "superpoint": extract_superpoint(image_rgb, processor, model),
         })
 
     print(f"Reference DB: {len(reference_db)} frames")
@@ -250,6 +258,28 @@ def save_results(results):
         writer.writerows(results)
     print(f"Results saved -> {out_path}")
 
+def summarise(df):
+    df["pose"] = df["success"].astype(str).str.lower() == "true"
+    df["ok"] = df["pose"] & (df["pos_err_m"] < POS_MAX_ERR) & (df["rot_err_deg"] < ROT_MAX_ERR)
+    df["range"] = pd.cut(df["gt_range"], [0, 11.5, 18.5, 30], labels=["near", "mid", "far"])
+    ok = df[df["ok"]]
+
+    summary = pd.DataFrame({
+        "success_%":   df.groupby("method")["ok"].mean() * 100,
+        "failures":    df.groupby("method")["ok"].apply(lambda s: (~s).sum()),
+        "pos_med_cm":  ok.groupby("method")["pos_err_m"].median() * 100,
+        "pos_p90_cm":  ok.groupby("method")["pos_err_m"].quantile(0.9) * 100,
+        "rot_med_deg": ok.groupby("method")["rot_err_deg"].median(),
+        "runtime_s":   df.groupby("method")["runtime_s"].median(),
+    }).round(2)
+    by_range = (ok.groupby(["range", "method"], observed=True)["pos_err_m"].median() * 100).unstack().round(1)
+
+    print(f"\nSuccess = pose found, pos < {POS_MAX_ERR} m, rot < {ROT_MAX_ERR} deg\n")
+    print(summary, "\n")
+    print("Median position error (cm) by range:\n", by_range, "\n")
+    print("Failures:\n", df.loc[~df["ok"], ["test_frame", "method", "gt_azimuth", "pos_err_m", "rot_err_deg"]]
+          .round(2).to_string(index=False))
+
 def match_binary(kp_test, des_test, reference_db, method):
     """ORB + AKAZE: kNN + Lowe ratio test against each training frame."""
     bf = cv2.BFMatcher(cv2.NORM_HAMMING)
@@ -273,33 +303,59 @@ def match_binary(kp_test, des_test, reference_db, method):
 
     return all_matches
 
-def match_lightglue(test_rgb, reference_db, processor, model):
-    h, w = test_rgb.shape[:2]
+def extract_superpoint(image_rgb, processor, model):
+    """Run SuperPoint once on one image. Returns pixel keypoints (N,2) and descriptors (N,256) on the model's device."""
+    h, w = image_rgb.shape[:2]
+    # The processor only accepts image pairs, so pass the image twice and keep the first
+    pixel_values = processor(images=[[image_rgb, image_rgb]], return_tensors="pt",
+                             do_resize=False)["pixel_values"][:, 0].to(model.device)
+    with torch.inference_mode():
+        keypoints, _, descriptors, mask = model.keypoint_detector(pixel_values)[:4]
+    valid = mask[0] > 0
     scale = torch.tensor([w, h], device=model.device, dtype=torch.float32)
+    return {
+        "keypoints": keypoints[0][valid].float() * scale,   # (N, 2) absolute pixels
+        "descriptors": descriptors[0][valid].float(),       # (N, 256)
+        "size": (h, w),
+    }
+
+
+def _pad(t, n):
+    """Zero-pad the first dimension of t to length n."""
+    return torch.cat([t, t.new_zeros((n - t.shape[0],) + t.shape[1:])], dim=0)
+
+def match_lightglue(test_feats, reference_db, model):
+    """Match cached SuperPoint features of the test image against cached reference features."""
+    h, w = test_feats["size"]
     all_matches = []
 
     for start in range(0, len(reference_db), LIGHTGLUE_BATCH):
         chunk = reference_db[start:start + LIGHTGLUE_BATCH]
-        pairs = [[test_rgb, ref["image_rgb"]] for ref in chunk]
+        n_max = max([test_feats["keypoints"].shape[0]] +
+                    [r["superpoint"]["keypoints"].shape[0] for r in chunk])
 
-        inputs = processor(images=pairs, return_tensors="pt", do_resize=False).to(model.device)
+        kps, descs, masks = [], [], []
+        for ref in chunk:
+            pair = (test_feats, ref["superpoint"])
+            kps.append(torch.stack([_pad(f["keypoints"], n_max) for f in pair]))
+            descs.append(torch.stack([_pad(f["descriptors"], n_max) for f in pair]))
+            masks.append(torch.stack([_pad(torch.ones(f["keypoints"].shape[0], device=model.device), n_max)
+                                      for f in pair]))
+
         with torch.inference_mode():
-            out = model(**inputs)
-
-        keypoints = out.keypoints.float() * scale   # (B, 2, N, 2) relative -> pixels
+            matches, scores = model._match_image_pair(
+                torch.stack(kps), torch.stack(descs), h, w, mask=torch.stack(masks))[:2]
 
         for i, ref in enumerate(chunk):
-            mask0 = out.mask[i, 0] > 0
-            mask1 = out.mask[i, 1] > 0
-            kp_test = keypoints[i, 0][mask0]
-            kp_ref = keypoints[i, 1][mask1]
-            matches = out.matches[i, 0][mask0]
-            scores = out.matching_scores[i, 0][mask0]
+            n_test = test_feats["keypoints"].shape[0]
+            n_ref = ref["superpoint"]["keypoints"].shape[0]
+            m = matches[i, 0, :n_test]
+            s = scores[i, 0, :n_test]
+            valid = (s > LIGHTGLUE_THRESHOLD) & (m > -1) & (m < n_ref)
 
-            valid = (scores > LIGHTGLUE_THRESHOLD) & (matches > -1) & (matches < kp_ref.shape[0])
-            pts_test = kp_test[valid].cpu().numpy().astype(np.float64)
-            pts_ref = kp_ref[matches[valid]].cpu().numpy().astype(np.float64)
-            match_scores = scores[valid].cpu().numpy()
+            pts_test = test_feats["keypoints"][valid].cpu().numpy().astype(np.float64)
+            pts_ref = ref["superpoint"]["keypoints"][m[valid]].cpu().numpy().astype(np.float64)
+            match_scores = s[valid].cpu().numpy()
 
             # Only keep matches on the lander
             u = np.clip(np.rint(pts_ref[:, 0]).astype(int), 0, w - 1)
@@ -308,8 +364,8 @@ def match_lightglue(test_rgb, reference_db, processor, model):
 
             all_matches.append({
                 "ref_frame": ref["frame"],
-                "pts_test": pts_test[on_lander],   # (M, 2) pixels in test image
-                "pts_ref": pts_ref[on_lander],     # (M, 2) pixels in reference image
+                "pts_test": pts_test[on_lander],
+                "pts_ref": pts_ref[on_lander],
                 "scores": match_scores[on_lander],
             })
 
@@ -324,6 +380,8 @@ def parse_args():
                         help="only run the first N test frames")
     parser.add_argument("--debug", action="store_true",
                         help="save lander mask and match visualisations")
+    parser.add_argument("--summary", type=Path,
+                         help="only summarise an existing results CSV")
     return parser.parse_args()
 
 
@@ -332,6 +390,10 @@ def parse_args():
 # =======
 def main():
     args = parse_args()
+
+    if args.summary:
+        summarise(pd.read_csv(args.summary))
+        return
 
     orb = cv2.ORB_create(nfeatures=3000)
     akaze = cv2.AKAZE_create()
@@ -346,7 +408,7 @@ def main():
     model = AutoModel.from_pretrained("ETH-CVG/lightglue_superpoint").to(device)
     model.eval()
 
-    reference_db = build_reference_db(REF_DIR, orb, akaze)
+    reference_db = build_reference_db(REF_DIR, orb, akaze, processor, model)
     if not reference_db:
         raise RuntimeError(f"No reference frames found in {REF_DIR}")
 
@@ -367,6 +429,8 @@ def main():
     test_poses = load_poses(TEST_DIR / "posev_testing.csv")
     results = []
 
+    match_lightglue(reference_db[0]["superpoint"], reference_db[:LIGHTGLUE_BATCH], model)
+
     for test_path in test_paths:
         image = cv2.imread(str(test_path))
         if image is None:
@@ -381,7 +445,7 @@ def main():
         methods = {
             "orb":       lambda: match_binary(*orb.detectAndCompute(gray, None), reference_db, "orb"),
             "akaze":     lambda: match_binary(*akaze.detectAndCompute(gray, None), reference_db, "akaze"),
-            "lightglue": lambda: match_lightglue(image_rgb, reference_db, processor, model),
+            "lightglue": lambda: match_lightglue(extract_superpoint(image_rgb, processor, model), reference_db, model),
         }
 
         if args.debug:
@@ -417,6 +481,7 @@ def main():
             results.append(row)
 
     save_results(results)
+    summarise(pd.DataFrame(results))
 
 
 if __name__ == "__main__":

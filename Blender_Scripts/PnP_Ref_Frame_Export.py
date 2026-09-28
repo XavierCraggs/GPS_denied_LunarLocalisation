@@ -11,7 +11,7 @@ import sys
 
 ## Constants
 MODE = 'TESTING'  # Options: 'TRAINING' or 'TESTING'
-NUM_TEST_FRAMES = 10  # Number of test frames to generate if in testing MODE
+NUM_TEST_FRAMES = 100  # Number of test frames to generate if in testing MODE
 CAMERA_HEIGHT = 1.5  # Height of the camera above the terrain
 Camera = bpy.data.objects['Rover_Camera']  
 Terrain = bpy.data.objects['Moon_Terrain']  
@@ -173,7 +173,9 @@ def store_camera_locations():
                     continue
 
     elif MODE == "TESTING":
-        for i in range(NUM_TEST_FRAMES):
+        attempts = 0
+        while len(camera_locations) < NUM_TEST_FRAMES and attempts < NUM_TEST_FRAMES * 10:
+            attempts += 1
             radius = random.uniform(min_dist, max_dist)
             angle = random.uniform(0, 360)
 
@@ -200,7 +202,7 @@ def store_camera_locations():
 ##Main 
 def main():
 
-    random.seed(67)
+    random.seed(67 if MODE == "TRAINING" else 68)
 
     scene = bpy.context.scene
 
