@@ -10,6 +10,8 @@ import sys
 
 
 ## Constants
+SCENE = "v2"
+
 MODE = 'TESTING'  # Options: 'TRAINING' or 'TESTING'
 NUM_TEST_FRAMES = 100  # Number of test frames to generate if in testing MODE
 CAMERA_HEIGHT = 1.5  # Height of the camera above the terrain
@@ -18,7 +20,7 @@ Terrain = bpy.data.objects['Moon_Terrain']
 Lander = bpy.data.objects['LAND_Base']
 
 #Paths for saved training frames
-DIR = bpy.path.abspath("//render_output/") 
+DIR = bpy.path.abspath(f"//render_output_{SCENE}/") 
 MODE_DIR = os.path.join(DIR, MODE)
 RGB = os.path.join(MODE_DIR, "RGB")
 EXR = os.path.join(MODE_DIR, "EXR")
@@ -76,6 +78,7 @@ def setup_gpu():
     scene.render.resolution_y = RESOLUTION_Y
     scene.render.resolution_percentage = 100
 
+    #scene.render.image_settings.color_depth = "16"
     scene.render.image_settings.file_format = "PNG"
     scene.render.image_settings.color_mode = "RGB"
 

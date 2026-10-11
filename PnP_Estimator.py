@@ -13,7 +13,9 @@ import time
 import pandas as pd
 
 ##setup
-ROOT = Path(__file__).resolve().parent.parent / "render_output"
+SCENE = "v2"
+
+ROOT = Path(__file__).resolve().parent.parent / f"render_output_{SCENE}"
 REF_DIR = ROOT / "TRAINING"
 TEST_DIR = ROOT / "TESTING"
 DEBUG_DIR = Path(__file__).resolve().parent / "debug"
@@ -34,8 +36,6 @@ MIN_INLIERS = 10            # minimum RANSAC inliers to accept a pose
 
 POS_MAX_ERR = 0.5   # Maximuim position and rotation error
 ROT_MAX_ERR = 5.0
-
-CLUSTER_M = 1.0 # Poses within distance are seen as agreeing
 
 R_BCAM2CV = np.diag([1.0, -1.0, -1.0])   # Blender camera axes -> OpenCV camera axes
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
@@ -248,7 +248,7 @@ def pose_error(pose, gt):
 
 def save_results(results):
     RESULTS_DIR.mkdir(exist_ok=True)
-    out_path = RESULTS_DIR / f"pnp_results_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    out_path = RESULTS_DIR / f"pnp_results_{SCENE}_{time.strftime('%Y%m%d_%H%M')}.csv"
     fields = ["test_frame", "method", "success", "ref_frame", "gt_range", "gt_azimuth",
               "n_matches", "n_lifted", "n_inliers", "reproj_px",
               "pos_err_m", "rot_err_deg", "est_x", "est_y", "est_z", "runtime_s"]
