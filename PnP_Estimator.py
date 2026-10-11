@@ -13,7 +13,7 @@ import time
 import pandas as pd
 
 ##setup
-SCENE = "v2"
+SCENE = "v1"
 
 ROOT = Path(__file__).resolve().parent.parent / f"render_output_{SCENE}"
 REF_DIR = ROOT / "TRAINING"
