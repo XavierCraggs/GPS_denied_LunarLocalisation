@@ -64,6 +64,16 @@ def iou(a, b):
     return (a & b).sum() / (a | b).sum()
 
 
+def edge_map(img_bgr, CLAHE_CLIP=dNONE,  CLAHE_TILE=(8, 8), BLUR_KSIZE=(5, 5), CANNY_LOW=10, CANNY_HIGH=30):
+    img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_TILE)
+    img_clahe = clahe.apply(img_gray)
+    img_blur = cv2.GaussianBlur(img_clahe, BLUR_KSIZE, 0)
+
+    edges = cv2.Canny(img_blur, CANNY_LOW, CANNY_HIGH)
+    return edges
+
+
 if __name__ == "__main__":
     V,F = load_mesh(MESH_PATH)
     K = pe.load_intrinsics(pe.INTRINSICS_PATH)

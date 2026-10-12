@@ -1,7 +1,5 @@
 import cv2
 import numpy as np
-from transformers import AutoImageProcessor, AutoModel
-import torch
 import OpenEXR
 import json
 import re
@@ -305,6 +303,8 @@ def match_binary(kp_test, des_test, reference_db, method):
 
 def extract_superpoint(image_rgb, processor, model):
     """Run SuperPoint once on one image. Returns pixel keypoints (N,2) and descriptors (N,256) on the model's device."""
+    import torch
+    
     h, w = image_rgb.shape[:2]
     # The processor only accepts image pairs, so pass the image twice and keep the first
     pixel_values = processor(images=[[image_rgb, image_rgb]], return_tensors="pt",
@@ -322,10 +322,12 @@ def extract_superpoint(image_rgb, processor, model):
 
 def _pad(t, n):
     """Zero-pad the first dimension of t to length n."""
+    import torch
     return torch.cat([t, t.new_zeros((n - t.shape[0],) + t.shape[1:])], dim=0)
 
 def match_lightglue(test_feats, reference_db, model):
     """Match cached SuperPoint features of the test image against cached reference features."""
+    import torch
     h, w = test_feats["size"]
     all_matches = []
 
@@ -389,6 +391,9 @@ def parse_args():
 #  Main
 # =======
 def main():
+    import torch
+    from transformers import AutoImageProcessor, AutoModel
+
     args = parse_args()
 
     if args.summary:
