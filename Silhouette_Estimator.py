@@ -1,13 +1,8 @@
 import PnP_Estimator as pe
-import csv
-import argparse 
-import OpenEXR
-import json
 import numpy as np
 from pathlib import Path
 import cv2
 import time
-import pandas
 
 
 
@@ -22,7 +17,7 @@ def load_mesh(path):
     with open(path, "r") as f:
             for line in f:
                 if line.startswith("v "):
-                    V.append([float(x) for x in line.split()[1:]])
+                    V.append([float(x) for x in line.split()[1:4]])
                 elif line.startswith("f "):
                     F.append([int(x.split("/")[0]) - 1 for x in line.split()[1:]])
 
@@ -31,7 +26,7 @@ def load_mesh(path):
     return V, F
 
 def project_points(V, R, t, K):
-    """ Converts 3D world points to 2D pixel coods and camera depth"""
+    """ Converts 3D world points to 2D pixel coordinates and camera depth"""
     Xc = V @ R.T + t
     z = Xc[:, 2]
     with np.errstate(divide='ignore', invalid='ignore'):
@@ -50,7 +45,7 @@ def project_mask(V, F, R, t, K, shape=(960, 1280), shift=2):
     return mask
 
 def outline(mask, min_pts=30):
-    """"""
+    """External contours of a 0/255 mask, with at least min_pts points"""
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     return [c for c in contours if len(c) >= min_pts]
 
@@ -64,15 +59,43 @@ def iou(a, b):
     return (a & b).sum() / (a | b).sum()
 
 
-def edge_map(img_bgr, CLAHE_CLIP=dNONE,  CLAHE_TILE=(8, 8), BLUR_KSIZE=(5, 5), CANNY_LOW=10, CANNY_HIGH=30):
-    img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_TILE)
-    img_clahe = clahe.apply(img_gray)
-    img_blur = cv2.GaussianBlur(img_clahe, BLUR_KSIZE, 0)
-
-    edges = cv2.Canny(img_blur, CANNY_LOW, CANNY_HIGH)
+def edge_map(img_bgr, clahe_clip=None, clahe_tile=(8, 8), blur_sigma=1.2, canny_low=10, canny_high=30, min_px=15):
+    """Binary edge map of the observed image"""
+    grey = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    if clahe_clip is not None:
+        grey = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=clahe_tile).apply(grey)
+    grey = cv2.GaussianBlur(grey, (0, 0), sigmaX=blur_sigma)
+    
+    edges = cv2.Canny(grey, canny_low, canny_high, L2gradient=True)
+    
+    if min_px > 0:
+        _, labels, stats, _ = cv2.connectedComponentsWithStats(edges, connectivity=8)
+        keep = stats[:, cv2.CC_STAT_AREA] >= min_px
+        keep[0] = False # background
+        edges = np.where(keep[labels], 255, 0).astype(np.uint8)
     return edges
 
+def dist_map(edges, tau=None):
+    """Distance (in pixels) from every pixel to nearest edge pixel, optionally truncated at tau"""
+    dt = cv2.distanceTransform((edges == 0).astype(np.uint8), cv2.DIST_L2, 5)
+    return dt if tau is None else np.minimum(dt, tau)
+
+def oracle_edges(gt_mask)L
+    """Outline observed from the ground-truth mask"""
+    edges = np.zeros_like(gt_mask, np.uint8)
+    cv2.drawContours(edges, outline(gt_mask.astype(np.uint8) * 255), -1, 255, 1)
+    return edges
+
+def recall(edges, gt_mask, tol=2.0):
+    """The fraction of the true lander outline that are with an edge found within the tolerace """
+    pts = np.vstack(outline(gt_mask.astype(np.uint8) * 255)).reshape(-1, 2)
+    d = dist_map(edges)
+    return (d[pts[:, 1], pts[:, 0]] <= tol).mean()
+
+def clutter(edges, gt_mask, near=4.0, far=50.0):
+    """Edge pixels that are not on the true lander outline, that can help the optimiser"""
+    d_obj = cv2.distanceTransform((gt_mask == 0).astype(np.uint8), cv2.DIST_L2, 5)
+    return int(((edges > 0) & (d_obj >= near) & (d_obj <= far)).sum())
 
 if __name__ == "__main__":
     V,F = load_mesh(MESH_PATH)
