@@ -3,10 +3,14 @@ import numpy as np
 from pathlib import Path
 import cv2
 import time
+import matplotlib.pyplot as plt
+import pandas as pd
+from scipy.optimize import minimize
 
 
 
 MESH_PATH = Path(__file__).resolve().parent / "Project_Intrinsics" / f"LAND_{pe.SCENE}.obj"
+SIL_MESH_PATH = Path(__file__).resolve().parent / "Project_Intrinsics" / f"LAND_{pe.SCENE}_sil.obj"
 RESULTS_DIR = Path(__file__).resolve().parent / "results_silhouette"
 
 CONFIGS = {
@@ -16,17 +20,19 @@ CONFIGS = {
     "no CLAHE, s2.0, 20/50":  dict(clahe_clip=None, blur_sigma=2.0, canny_low=20, canny_high=50),
 }
 
+SLICE_NAMES = ["tilt dθx (°)", "pan dθy (°)", "roll dθz (°)",
+               "right dCx (m)", "down dCy (m)", "forward dCz (m)"]
 
 def load_mesh(path):
     V = []
     F = []  
 
     with open(path, "r") as f:
-            for line in f:
-                if line.startswith("v "):
-                    V.append([float(x) for x in line.split()[1:4]])
-                elif line.startswith("f "):
-                    F.append([int(x.split("/")[0]) - 1 for x in line.split()[1:]])
+        for line in f:
+            if line.startswith("v "):
+                V.append([float(x) for x in line.split()[1:4]])
+            elif line.startswith("f "):
+                F.append([int(x.split("/")[0]) - 1 for x in line.split()[1:]])
 
     V = np.array(V, dtype=np.float32)
     F = np.array(F, dtype=np.int32)
@@ -112,24 +118,181 @@ def drop_border(pts, shape, gap = 2):
     keep = (x >= gap) & (x < w - gap) & (y >= gap) & (y < h - gap)
     return pts[keep]
 
+def perturb(R0, C0, p):
+    """Pose = base pose nudged by p = [tilt, pan, roll (deg), right, down, forward (m)], camera-frame."""
+    dR = cv2.Rodrigues(np.radians(np.asarray(p[:3], float)))[0]
+    R = dR @ R0                                    # rotate about the camera's own axes
+    C = C0 + R0.T @ np.asarray(p[3:], float)       # camera-frame offset -> world
+    return R, -R @ C
+
+def contour_samples(mask, n=300, min_pts=30):
+    """n evenly spaced outline points (x, y), excluding image-border truncation."""
+    cs = outline(mask)
+    if not cs:
+        return None
+    pts = drop_border(np.vstack(cs).reshape(-1, 2), mask.shape)
+    if len(pts) < min_pts:
+        return None
+    return pts[np.linspace(0, len(pts), n, endpoint=False).astype(int)]
+
+
+def make_ctx(V, F, K, R0, C0, obs_edges, tau=20.0, roi_pad=0.3):
+    """Requirements for the cost function at a given pose and image."""
+    m0 = project_mask(V, F, R0, -R0 @ C0, K, obs_edges.shape)
+    x, y, w, h = cv2.boundingRect(m0)
+    x0, y0 = max(x - int(w * roi_pad), 0), max(y - int(h * roi_pad), 0)
+    x1, y1 = x + w + int(w * roi_pad), y + h + int(h * roi_pad)
+    ys, xs = np.nonzero(obs_edges[y0:y1, x0:x1])          # observed edges in the FIXED ROI
+    return dict(V=V, F=F, K=K, R0=R0, C0=C0, L=V.mean(axis=0), tau=tau, shape=obs_edges.shape,
+                dt_obs=dist_map(obs_edges, tau),
+                roi_pts=np.column_stack([xs + x0, ys + y0]))
+
+
+def cost_terms(p, ctx):
+    """(forward, reverse) truncated chamfer at pose p. Both in pixels, max tau."""
+    R, t = perturb(ctx["R0"], ctx["C0"], p)
+    mask = project_mask(ctx["V"], ctx["F"], R, t, ctx["K"], ctx["shape"])
+    pts = contour_samples(mask)
+    if pts is None:
+        return ctx["tau"], ctx["tau"]
+    forward = ctx["dt_obs"][pts[:, 1], pts[:, 0]].mean()       # model outline -> nearest observed edge
+
+    model_edges = np.zeros(ctx["shape"], np.uint8)
+    cv2.drawContours(model_edges, outline(mask), -1, 255, 1)
+    rp = ctx["roi_pts"]
+    reverse = dist_map(model_edges, ctx["tau"])[rp[:, 1], rp[:, 0]].mean() if len(rp) else 0.0
+    return forward, reverse                                     # cost = forward + lam * reverse
+
+
+def slices(ctx, rot_range=10, pos_range=3, steps=21):
+    """Sweep each parameter alone around the base pose"""
+    out = {}
+    for i in range(6):
+        span = rot_range if i < 3 else pos_range
+        xs = np.linspace(-span, span, steps)
+        terms = []
+        for d in xs:
+            p = np.zeros(6)
+            p[i] = d
+            terms.append(cost_terms(p, ctx))
+        out[i] = (xs, np.array(terms))
+    return out
+
+
+def plot_slices(res, title, path, lam=0.5):
+    fig, axes = plt.subplots(2, 3, figsize=(12, 6))
+    for i, ax in enumerate(axes.flat):
+        xs, fr = res[i]
+        ax.plot(xs, fr[:, 0], label="forward")
+        ax.plot(xs, fr[:, 0] + lam * fr[:, 1], label=f"forward + {lam}·reverse")
+        ax.axvline(0, color="k", lw=0.5)
+        ax.set_xlabel(SLICE_NAMES[i])
+        ax.set_ylabel("cost (px)")
+    axes[0, 0].legend(fontsize=8)
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=100)
+    plt.close(fig)
+
+def perturb_obj(R0, C0, L, p):
+    """Object-centred nudge: rotate about the lander centre L, shift it in the camera frame.
+    p = [rot x, y, z (deg), shift right, down, depth (m)]. Decouples image shift from shape change."""
+    dR = cv2.Rodrigues(np.radians(np.asarray(p[:3], float)))[0]
+    R = dR @ R0
+    Lc = R0 @ (L - C0)                                   # lander centre in the base camera frame
+    t = Lc + np.asarray(p[3:], float) - R @ L
+    return R, -R.T @ t                                   # (R, C)
+
+
+def cost(p, ctx, lam=0.0):
+    """Scalar cost = forward + lam * reverse"""
+    R, C = perturb_obj(ctx["R0"], ctx["C0"], ctx["L"], p)
+    mask = project_mask(ctx["V"], ctx["F"], R, -R @ C, ctx["K"], ctx["shape"])
+    pts = contour_samples(mask)
+    if pts is None:
+        return ctx["tau"] * (1 + lam)
+    c = ctx["dt_obs"][pts[:, 1], pts[:, 0]].mean()
+    if lam > 0 and len(ctx["roi_pts"]):
+        model_edges = np.zeros(ctx["shape"], np.uint8)
+        cv2.drawContours(model_edges, outline(mask), -1, 255, 1)
+        rp = ctx["roi_pts"]
+        c += lam * dist_map(model_edges, ctx["tau"])[rp[:, 1], rp[:, 0]].mean()
+    return float(c)
+
+
+# (tau px, rotation step deg, lateral step m, depth step m)
+LEVELS = ((60.0, 5.0, 0.3, 1.0), (20.0, 1.5, 0.08, 0.3), (10.0, 0.5, 0.03, 0.1))
+
+
+def refine(V, F, K, R0, C0, obs_edges, lam=0.0, levels=LEVELS, restarts=2, maxfev=300):
+    """Coarse-to-fine Nelder-Mead from (R0, C0). Returns R, C, final cost, evaluations used."""
+    R, C, nfev, fun = R0, C0, 0, None
+    for tau, rot, lat, dep in levels:
+        for _ in range(restarts):                       # fresh simplex beats NM's early stopping
+            ctx = make_ctx(V, F, K, R, C, obs_edges, tau)
+            simplex = np.vstack([np.zeros(6), np.diag([rot, rot, rot, lat, lat, dep])])
+            res = minimize(cost, np.zeros(6), args=(ctx, lam), method="Nelder-Mead",
+                           options=dict(initial_simplex=simplex, xatol=0.01, fatol=0.01, maxfev=maxfev))
+            R, C = perturb_obj(R, C, ctx["L"], res.x)
+            nfev, fun = nfev + res.nfev, res.fun
+    return R, C, fun, nfev
+
+
+def add_noise(R, C, rot_deg, pos_m, rng):
+    """Random rotation of exactly rot_deg and random camera offset of exactly pos_m."""
+    axis = rng.normal(size=3)
+    axis /= np.linalg.norm(axis)
+    d = rng.normal(size=3)
+    d /= np.linalg.norm(d)
+    return cv2.Rodrigues(axis * np.radians(rot_deg))[0] @ R, C + d * pos_m
+
+
+def pose_err(R, C, gt):
+    """Same metric as PnP (single source of truth)."""
+    pose = {"rvec": cv2.Rodrigues(R)[0], "tvec": (-R @ C).reshape(3, 1)}
+    pos, rot, _ = pe.pose_error(pose, gt)
+    return pos, rot
+
+
 if __name__ == "__main__":
-    out_dir = pe.DEBUG_DIR / "silhouette"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    mesh = SIL_MESH_PATH if SIL_MESH_PATH.exists() else MESH_PATH
+    V, F = load_mesh(mesh)
+    K = pe.load_intrinsics(pe.INTRINSICS_PATH)
+    poses = pe.load_poses(pe.TEST_DIR / "posev_testing.csv") 
+    RESULTS_DIR.mkdir(exist_ok=True)
+    out_csv = RESULTS_DIR / f"basin_{pe.SCENE}_{time.strftime('%Y-%m-%d_%H-%M')}.csv"
 
 
-    for frame in (99, 34, 15, 31, 57):                 # near, near, mid, mid, far
+    FRAMES = sorted(poses, key=lambda f: poses[f]["range"])[::7]
+    NOISE = [(2, 0.5), (5, 1.0), (10, 2.0)]
+    LAMS = [0.0]                                        # add 0.5 once lam=0 works
+    rng = np.random.default_rng(0)
+    rows = []
 
+    for frame in FRAMES:                
+        gt = poses[frame]
         img = cv2.imread(str(pe.TEST_DIR / "RGB" / f"frame_{frame:04d}.png"))
         _, index_map = pe.decompose_EXR(pe.TEST_DIR / "EXR" / f"frame_{frame:04d}.exr")
-        gt_mask = index_map == pe.LANDER_INDEX        
+        obs = {"oracle": oracle_edges(index_map == pe.LANDER_INDEX),
+            "edges": edge_map(img)
+        }       
 
-        for i in CONFIGS:
-            print(f"frame {frame:3d}  config {i}")
-            edges = edge_map(img, **CONFIGS[i])
-            dt = dist_map(edges, tau=20)
+        for rot_deg, pos_m in NOISE:
+                    R0, C0 = add_noise(gt["R_world2cv"], gt["C"], rot_deg, pos_m, rng)   # same start for every variant
+                    for obs_name, obs_edges in obs.items():
+                        for lam in LAMS:
+                            t0 = time.perf_counter()
+                            R, C, fun, nfev = refine(V, F, K, R0, C0, obs_edges, lam)
+                            pos, rot = pose_err(R, C, gt)
+                            ok = pos < pe.POS_MAX_ERR and rot < pe.ROT_MAX_ERR
+                            rows.append(dict(frame=frame, range=gt["range"], noise_rot=rot_deg, noise_pos=pos_m,
+                                            obs=obs_name, lam=lam, pos_err=pos, rot_err=rot, ok=ok,
+                                            cost=fun, nfev=nfev, runtime=time.perf_counter() - t0))
+                            print(f"f{frame:3d} {rot_deg:>2}°/{pos_m}m {obs_name:6s} lam {lam}: "
+                                f"pos {pos:.3f} m rot {rot:.2f}° {'OK' if ok else '--'}  "
+                                f"cost {fun:.2f} nfev {nfev} {rows[-1]['runtime']:.0f}s")
+                            pd.DataFrame(rows).to_csv(out_csv, index=False)   # save as you go
 
-            cv2.imwrite(str(out_dir / f"{pe.SCENE}_edges_{frame:04d}_{i}.png"), edges)
-            cv2.imwrite(str(out_dir / f"{pe.SCENE}_dist_{frame:04d}_{i}.png"), (dt / 20 * 255).astype(np.uint8))
-
-            print(f"frame {frame:3d}  recall {recall(edges, gt_mask):.3f} clutter {clutter(edges, gt_mask):6d}" 
-                  f" oracle recall {recall(oracle_edges(gt_mask), gt_mask):.3f}")
+    df = pd.DataFrame(rows)
+    print(df.groupby(["obs", "lam", "noise_rot"])[["ok", "pos_err", "rot_err", "runtime"]]
+            .agg({"ok": "mean", "pos_err": "median", "rot_err": "median", "runtime": "median"}).round(3))
