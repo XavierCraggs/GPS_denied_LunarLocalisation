@@ -9,6 +9,13 @@ import time
 MESH_PATH = Path(__file__).resolve().parent / "Project_Intrinsics" / f"LAND_{pe.SCENE}.obj"
 RESULTS_DIR = Path(__file__).resolve().parent / "results_silhouette"
 
+CONFIGS = {
+    "report (CLAHE, 50/150)": dict(clahe_clip=2.0, blur_sigma=1.0, canny_low=50, canny_high=150),
+    "no CLAHE, s1.2, 10/30":  dict(clahe_clip=None, blur_sigma=1.2, canny_low=10, canny_high=30),
+    "CLAHE, s1.2, 10/30":     dict(clahe_clip=2.0, blur_sigma=1.2, canny_low=10, canny_high=30),
+    "no CLAHE, s2.0, 20/50":  dict(clahe_clip=None, blur_sigma=2.0, canny_low=20, canny_high=50),
+}
+
 
 def load_mesh(path):
     V = []
@@ -80,7 +87,7 @@ def dist_map(edges, tau=None):
     dt = cv2.distanceTransform((edges == 0).astype(np.uint8), cv2.DIST_L2, 5)
     return dt if tau is None else np.minimum(dt, tau)
 
-def oracle_edges(gt_mask)L
+def oracle_edges(gt_mask):
     """Outline observed from the ground-truth mask"""
     edges = np.zeros_like(gt_mask, np.uint8)
     cv2.drawContours(edges, outline(gt_mask.astype(np.uint8) * 255), -1, 255, 1)
@@ -89,6 +96,7 @@ def oracle_edges(gt_mask)L
 def recall(edges, gt_mask, tol=2.0):
     """The fraction of the true lander outline that are with an edge found within the tolerace """
     pts = np.vstack(outline(gt_mask.astype(np.uint8) * 255)).reshape(-1, 2)
+    pts = drop_border(pts, gt_mask.shape)
     d = dist_map(edges)
     return (d[pts[:, 1], pts[:, 0]] <= tol).mean()
 
@@ -97,26 +105,31 @@ def clutter(edges, gt_mask, near=4.0, far=50.0):
     d_obj = cv2.distanceTransform((gt_mask == 0).astype(np.uint8), cv2.DIST_L2, 5)
     return int(((edges > 0) & (d_obj >= near) & (d_obj <= far)).sum())
 
+def drop_border(pts, shape, gap = 2):
+    """Removes points lying on the image border (non real edges)"""
+    h, w = shape[:2]
+    x, y = pts[:, 0], pts[:, 1]
+    keep = (x >= gap) & (x < w - gap) & (y >= gap) & (y < h - gap)
+    return pts[keep]
+
 if __name__ == "__main__":
-    V,F = load_mesh(MESH_PATH)
-    K = pe.load_intrinsics(pe.INTRINSICS_PATH)
-    poses = pe.load_poses(pe.TEST_DIR / "posev_testing.csv")
     out_dir = pe.DEBUG_DIR / "silhouette"
     out_dir.mkdir(parents=True, exist_ok=True)
 
 
     for frame in (99, 34, 15, 31, 57):                 # near, near, mid, mid, far
-        gt = poses[frame]
-        R = gt["R_world2cv"]
-        t = -R @ gt["C"]
 
-        t0 = time.perf_counter()
-        mask = project_mask(V, F, R, t, K)
-        dt = time.perf_counter() - t0
-
+        img = cv2.imread(str(pe.TEST_DIR / "RGB" / f"frame_{frame:04d}.png"))
         _, index_map = pe.decompose_EXR(pe.TEST_DIR / "EXR" / f"frame_{frame:04d}.exr")
         gt_mask = index_map == pe.LANDER_INDEX        
-        img = cv2.imread(str(pe.TEST_DIR / "RGB" / f"frame_{frame:04d}.png"))
-        cv2.imwrite(str(out_dir / f"{pe.SCENE}_frame_{frame:04d}.png"), draw_overlay(img, mask))
 
-        print(f"frame {frame:3d}  range {gt['range']:5.1f} m  IoU {iou(mask, gt_mask):.4f}  project {dt*1000:.0f} ms")
+        for i in CONFIGS:
+            print(f"frame {frame:3d}  config {i}")
+            edges = edge_map(img, **CONFIGS[i])
+            dt = dist_map(edges, tau=20)
+
+            cv2.imwrite(str(out_dir / f"{pe.SCENE}_edges_{frame:04d}_{i}.png"), edges)
+            cv2.imwrite(str(out_dir / f"{pe.SCENE}_dist_{frame:04d}_{i}.png"), (dt / 20 * 255).astype(np.uint8))
+
+            print(f"frame {frame:3d}  recall {recall(edges, gt_mask):.3f} clutter {clutter(edges, gt_mask):6d}" 
+                  f" oracle recall {recall(oracle_edges(gt_mask), gt_mask):.3f}")
