@@ -227,7 +227,7 @@ def cost(p, ctx, lam=0.0, trim=1.0):
 LEVELS = ((60.0, 5.0, 0.3, 1.0, 1.0), (20.0, 1.5, 0.08, 0.3, 1.0), (10.0, 0.5, 0.03, 0.1, 0.8))
 
 
-def refine(V, F, K, R0, C0, obs_edges, lam=0.0, trim=1.0, levels=LEVELS, restarts=2, maxfev=300):
+def refine(V, F, K, R0, C0, obs_edges, lam=0.0, levels=LEVELS, restarts=2, maxfev=300):
     """Coarse-to-fine Nelder-Mead from (R0, C0). Returns R, C, final cost, evaluations used."""
     R, C, nfev, fun = R0, C0, 0, None
     for tau, rot, lat, dep, trim in levels:
@@ -260,7 +260,8 @@ def pose_err(R, C, gt):
 SEARCH_SCALES = (0.75, 0.87, 1.0, 1.15, 1.3)    # covers 7–23 m from rings at 8/15/22 m
 SEARCH_DOWNSAMPLE = 2                            # search at half resolution 
 SEARCH_PAD = 150                                 # px of tau-padding so border-cut silhouettes can match
-
+SEARCH_BAND = (2, 8)        # outer band, in downsampled px (≈ 4–16 px at full resolution)
+SEARCH_BAND_W = 60.0 
 
 def build_ref_db(V, F, K, ref_poses, shape=(960, 1280)):
     """Project the mesh at every reference pose once: outline points relative to the silhouette centroid."""
@@ -273,39 +274,49 @@ def build_ref_db(V, F, K, ref_poses, shape=(960, 1280)):
             continue
         m = cv2.moments(mask, binaryImage=True)
         centroid = np.array([m["m10"] / m["m00"], m["m01"] / m["m00"]])
-        pts = np.vstack(cs).reshape(-1, 2).astype(float)
-        db.append(dict(frame=frame, R=R, C=C, centroid=centroid, rel_pts=pts - centroid))
+        db.append(dict(frame=frame, R=R, C=C, centroid=centroid, contours=[c.reshape(-1, 2) -centroid for c in cs]))
     return db
 
 
-def _template(rel_pts, scale, ds):
-    """1-px outline template at scale/ds. Returns (template, centroid position inside it, n points)."""
-    p = np.unique(np.round(rel_pts * scale / ds).astype(int), axis=0)
-    origin = p.min(axis=0)
-    p -= origin
-    tmpl = np.zeros((p[:, 1].max() + 1, p[:, 0].max() + 1), np.float32)
-    tmpl[p[:, 1], p[:, 0]] = 1.0
-    return tmpl, -origin, len(p)
+def _templates(contours, scale, ds, band=SEARCH_BAND):
+    """Outline template + outer-band template on the same canvas, at scale/ds.
+    Returns (line, ring, centroid position in canvas, n line px, n ring px)."""
+    cs = [np.round(c * scale / ds).astype(np.int32) for c in contours]
+    margin = band[1] + 2
+    origin = np.vstack(cs).min(axis=0) - margin
+    size = np.vstack(cs).max(axis=0) - origin + margin + 1
+    cs = [(c - origin).reshape(-1, 1, 2) for c in cs]
+    fill = np.zeros((size[1], size[0]), np.uint8)
+    cv2.drawContours(fill, cs, -1, 255, -1)
+    line = np.zeros_like(fill)
+    cv2.drawContours(line, cs, -1, 1, 1)
+    disk = lambda r: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    ring = (cv2.dilate(fill, disk(band[1])) > 0) & ~(cv2.dilate(fill, disk(band[0])) > 0)
+    return line.astype(np.float32), ring.astype(np.float32), -origin, line.sum(), ring.sum()
 
 
-def search_refs(dt_obs, ref_db, scales=SEARCH_SCALES, ds=SEARCH_DOWNSAMPLE, pad=SEARCH_PAD):
-    """Chamfer template search over the whole image: best (scale, centroid) per reference, best first."""
-    tau = float(dt_obs.max())
-    small = cv2.resize(dt_obs, None, fx=1 / ds, fy=1 / ds, interpolation=cv2.INTER_AREA)
+def search_refs(edges, ref_db, tau=20.0, w=SEARCH_BAND_W, scales=SEARCH_SCALES,
+                ds=SEARCH_DOWNSAMPLE, pad=SEARCH_PAD):
+    """Global template search. Score = mean chamfer + w * edge density in a band just OUTSIDE
+    the outline (true outline -> sparse background; shrunken outline inside the lander -> busy)."""
+    dt = cv2.resize(dist_map(edges, tau), None, fx=1 / ds, fy=1 / ds, interpolation=cv2.INTER_AREA)
+    ed = cv2.resize((edges > 0).astype(np.float32), None, fx=1 / ds, fy=1 / ds, interpolation=cv2.INTER_AREA)
     b = pad // ds
-    small = cv2.copyMakeBorder(small, b, b, b, b, cv2.BORDER_CONSTANT, value=tau)
+    dt = cv2.copyMakeBorder(dt, b, b, b, b, cv2.BORDER_CONSTANT, value=tau)
+    ed = cv2.copyMakeBorder(ed, b, b, b, b, cv2.BORDER_CONSTANT, value=0)
     out = []
     for ref in ref_db:
         best = None
         for s in scales:
-            tmpl, c_in, n = _template(ref["rel_pts"], s, ds)
-            if tmpl.shape[0] >= small.shape[0] or tmpl.shape[1] >= small.shape[1]:
+            line, ring, c_in, n, nr = _templates(ref["contours"], s, ds)
+            if line.shape[0] >= dt.shape[0] or line.shape[1] >= dt.shape[1]:
                 continue
-            res = cv2.matchTemplate(small, tmpl, cv2.TM_CCORR) / n          # mean chamfer at every offset
-            score, _, loc, _ = cv2.minMaxLoc(res)
-            if best is None or score < best["score"]:
-                centroid = (np.array(loc) + c_in) * ds - pad              # back to full-res image coords
-                best = dict(ref=ref, scale=s, score=score, centroid=centroid)
+            score = cv2.matchTemplate(dt, line, cv2.TM_CCORR) / n
+            if w > 0:
+                score += w * cv2.matchTemplate(ed, ring, cv2.TM_CCORR) / nr
+            v, _, loc, _ = cv2.minMaxLoc(score)
+            if best is None or v < best["score"]:
+                best = dict(ref=ref, scale=s, score=v, centroid=(np.array(loc) + c_in) * ds - pad)
         if best:
             out.append(best)
     return sorted(out, key=lambda c: c["score"])
@@ -333,7 +344,7 @@ def start_pose(cand, K, L):
 def localise_silhouette(V, F, K, ref_db, obs_edges, k=3, lam=0.0, levels=LEVELS):
     """Full silhouette localisation: global search -> k starts -> coarse level each -> refine the best."""
     L = V.mean(axis=0)
-    cands = search_refs(dist_map(obs_edges, levels[1][0]), ref_db)[:k]
+    cands = search_refs(obs_edges, ref_db, tau=levels[1][0])[:k]
     coarse = []
     for cand in cands:
         R0, C0 = start_pose(cand, K, L)

@@ -138,7 +138,7 @@ def exp_init():
         img = cv2.imread(str(pe.TEST_DIR / "RGB" / f"frame_{frame:04d}.png"))
         for obs_name, obs_edges in _observations(frame, FINAL_EDGE_CFG).items():
             t0 = time.perf_counter()
-            cand = se.search_refs(se.dist_map(obs_edges, 20.0), _W["ref_db"])[0]
+            cand = se.search_refs(obs_edges, _W["ref_db"])[0]
             R0, C0 = se.start_pose(cand, K, L)
             pos, rot = se.pose_err(R0, C0, gt)
             rows.append(dict(frame=frame, range=gt["range"], obs=obs_name, ref=cand["ref"]["frame"],
