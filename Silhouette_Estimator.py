@@ -204,14 +204,17 @@ def perturb_obj(R0, C0, L, p):
     return R, -R.T @ t                                   # (R, C)
 
 
-def cost(p, ctx, lam=0.0):
+def cost(p, ctx, lam=0.0, trim=1.0):
     """Scalar cost = forward + lam * reverse"""
     R, C = perturb_obj(ctx["R0"], ctx["C0"], ctx["L"], p)
     mask = project_mask(ctx["V"], ctx["F"], R, -R @ C, ctx["K"], ctx["shape"])
     pts = contour_samples(mask)
     if pts is None:
         return ctx["tau"] * (1 + lam)
-    c = ctx["dt_obs"][pts[:, 1], pts[:, 0]].mean()
+    d = ctx["dt_obs"][pts[:, 1], pts[:, 0]]
+    if trim < 1.0:
+        d = np.sort(d)[: max(1, int(trim * len(d)))]  # trim the worst outliers
+    c = d.mean()
     if lam > 0 and len(ctx["roi_pts"]):
         model_edges = np.zeros(ctx["shape"], np.uint8)
         cv2.drawContours(model_edges, outline(mask), -1, 255, 1)
@@ -224,14 +227,14 @@ def cost(p, ctx, lam=0.0):
 LEVELS = ((60.0, 5.0, 0.3, 1.0), (20.0, 1.5, 0.08, 0.3), (10.0, 0.5, 0.03, 0.1))
 
 
-def refine(V, F, K, R0, C0, obs_edges, lam=0.0, levels=LEVELS, restarts=2, maxfev=300):
+def refine(V, F, K, R0, C0, obs_edges, lam=0.0, trim=1.0, levels=LEVELS, restarts=2, maxfev=300):
     """Coarse-to-fine Nelder-Mead from (R0, C0). Returns R, C, final cost, evaluations used."""
     R, C, nfev, fun = R0, C0, 0, None
     for tau, rot, lat, dep in levels:
         for _ in range(restarts):                       # fresh simplex beats NM's early stopping
             ctx = make_ctx(V, F, K, R, C, obs_edges, tau)
             simplex = np.vstack([np.zeros(6), np.diag([rot, rot, rot, lat, lat, dep])])
-            res = minimize(cost, np.zeros(6), args=(ctx, lam), method="Nelder-Mead",
+            res = minimize(cost, np.zeros(6), args=(ctx, lam, trim), method="Nelder-Mead",
                            options=dict(initial_simplex=simplex, xatol=0.01, fatol=0.01, maxfev=maxfev))
             R, C = perturb_obj(R, C, ctx["L"], res.x)
             nfev, fun = nfev + res.nfev, res.fun
@@ -254,45 +257,45 @@ def pose_err(R, C, gt):
     return pos, rot
 
 
-if __name__ == "__main__":
-    mesh = SIL_MESH_PATH if SIL_MESH_PATH.exists() else MESH_PATH
-    V, F = load_mesh(mesh)
-    K = pe.load_intrinsics(pe.INTRINSICS_PATH)
-    poses = pe.load_poses(pe.TEST_DIR / "posev_testing.csv") 
-    RESULTS_DIR.mkdir(exist_ok=True)
-    out_csv = RESULTS_DIR / f"basin_{pe.SCENE}_{time.strftime('%Y-%m-%d_%H-%M')}.csv"
+# if __name__ == "__main__":
+#     mesh = SIL_MESH_PATH if SIL_MESH_PATH.exists() else MESH_PATH
+#     V, F = load_mesh(mesh)
+#     K = pe.load_intrinsics(pe.INTRINSICS_PATH)
+#     poses = pe.load_poses(pe.TEST_DIR / "posev_testing.csv") 
+#     RESULTS_DIR.mkdir(exist_ok=True)
+#     out_csv = RESULTS_DIR / f"basin_{pe.SCENE}_{time.strftime('%Y-%m-%d_%H-%M')}.csv"
 
 
-    FRAMES = sorted(poses, key=lambda f: poses[f]["range"])[::7]
-    NOISE = [(2, 0.5), (5, 1.0), (10, 2.0)]
-    LAMS = [0.0]                                        # add 0.5 once lam=0 works
-    rng = np.random.default_rng(0)
-    rows = []
+#     FRAMES = sorted(poses, key=lambda f: poses[f]["range"])[::7]
+#     NOISE = [(2, 0.5), (5, 1.0), (10, 2.0)]
+#     LAMS = [0.0]                                        # add 0.5 once lam=0 works
+#     rng = np.random.default_rng(0)
+#     rows = []
 
-    for frame in FRAMES:                
-        gt = poses[frame]
-        img = cv2.imread(str(pe.TEST_DIR / "RGB" / f"frame_{frame:04d}.png"))
-        _, index_map = pe.decompose_EXR(pe.TEST_DIR / "EXR" / f"frame_{frame:04d}.exr")
-        obs = {"oracle": oracle_edges(index_map == pe.LANDER_INDEX),
-            "edges": edge_map(img)
-        }       
+#     for frame in FRAMES:                
+#         gt = poses[frame]
+#         img = cv2.imread(str(pe.TEST_DIR / "RGB" / f"frame_{frame:04d}.png"))
+#         _, index_map = pe.decompose_EXR(pe.TEST_DIR / "EXR" / f"frame_{frame:04d}.exr")
+#         obs = {"oracle": oracle_edges(index_map == pe.LANDER_INDEX),
+#             "edges": edge_map(img)
+#         }       
 
-        for rot_deg, pos_m in NOISE:
-                    R0, C0 = add_noise(gt["R_world2cv"], gt["C"], rot_deg, pos_m, rng)   # same start for every variant
-                    for obs_name, obs_edges in obs.items():
-                        for lam in LAMS:
-                            t0 = time.perf_counter()
-                            R, C, fun, nfev = refine(V, F, K, R0, C0, obs_edges, lam)
-                            pos, rot = pose_err(R, C, gt)
-                            ok = pos < pe.POS_MAX_ERR and rot < pe.ROT_MAX_ERR
-                            rows.append(dict(frame=frame, range=gt["range"], noise_rot=rot_deg, noise_pos=pos_m,
-                                            obs=obs_name, lam=lam, pos_err=pos, rot_err=rot, ok=ok,
-                                            cost=fun, nfev=nfev, runtime=time.perf_counter() - t0))
-                            print(f"f{frame:3d} {rot_deg:>2}°/{pos_m}m {obs_name:6s} lam {lam}: "
-                                f"pos {pos:.3f} m rot {rot:.2f}° {'OK' if ok else '--'}  "
-                                f"cost {fun:.2f} nfev {nfev} {rows[-1]['runtime']:.0f}s")
-                            pd.DataFrame(rows).to_csv(out_csv, index=False)   # save as you go
+#         for rot_deg, pos_m in NOISE:
+#                     R0, C0 = add_noise(gt["R_world2cv"], gt["C"], rot_deg, pos_m, rng)   # same start for every variant
+#                     for obs_name, obs_edges in obs.items():
+#                         for lam in LAMS:
+#                             t0 = time.perf_counter()
+#                             R, C, fun, nfev = refine(V, F, K, R0, C0, obs_edges, lam)
+#                             pos, rot = pose_err(R, C, gt)
+#                             ok = pos < pe.POS_MAX_ERR and rot < pe.ROT_MAX_ERR
+#                             rows.append(dict(frame=frame, range=gt["range"], noise_rot=rot_deg, noise_pos=pos_m,
+#                                             obs=obs_name, lam=lam, pos_err=pos, rot_err=rot, ok=ok,
+#                                             cost=fun, nfev=nfev, runtime=time.perf_counter() - t0))
+#                             print(f"f{frame:3d} {rot_deg:>2}°/{pos_m}m {obs_name:6s} lam {lam}: "
+#                                 f"pos {pos:.3f} m rot {rot:.2f}° {'OK' if ok else '--'}  "
+#                                 f"cost {fun:.2f} nfev {nfev} {rows[-1]['runtime']:.0f}s")
+#                             pd.DataFrame(rows).to_csv(out_csv, index=False)   # save as you go
 
-    df = pd.DataFrame(rows)
-    print(df.groupby(["obs", "lam", "noise_rot"])[["ok", "pos_err", "rot_err", "runtime"]]
-            .agg({"ok": "mean", "pos_err": "median", "rot_err": "median", "runtime": "median"}).round(3))
+#     df = pd.DataFrame(rows)
+#     print(df.groupby(["obs", "lam", "noise_rot"])[["ok", "pos_err", "rot_err", "runtime"]]
+#             .agg({"ok": "mean", "pos_err": "median", "rot_err": "median", "runtime": "median"}).round(3))
