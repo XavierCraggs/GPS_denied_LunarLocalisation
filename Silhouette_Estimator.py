@@ -223,14 +223,14 @@ def cost(p, ctx, lam=0.0, trim=1.0):
     return float(c)
 
 
-# (tau px, rotation step deg, lateral step m, depth step m)
-LEVELS = ((60.0, 5.0, 0.3, 1.0), (20.0, 1.5, 0.08, 0.3), (10.0, 0.5, 0.03, 0.1))
+# (tau px, rotation step deg, lateral step m, depth step m, trim fraction)
+LEVELS = ((60.0, 5.0, 0.3, 1.0, 1.0), (20.0, 1.5, 0.08, 0.3, 1.0), (10.0, 0.5, 0.03, 0.1, 0.8))
 
 
 def refine(V, F, K, R0, C0, obs_edges, lam=0.0, trim=1.0, levels=LEVELS, restarts=2, maxfev=300):
     """Coarse-to-fine Nelder-Mead from (R0, C0). Returns R, C, final cost, evaluations used."""
     R, C, nfev, fun = R0, C0, 0, None
-    for tau, rot, lat, dep in levels:
+    for tau, rot, lat, dep, trim in levels:
         for _ in range(restarts):                       # fresh simplex beats NM's early stopping
             ctx = make_ctx(V, F, K, R, C, obs_edges, tau)
             simplex = np.vstack([np.zeros(6), np.diag([rot, rot, rot, lat, lat, dep])])
@@ -256,6 +256,93 @@ def pose_err(R, C, gt):
     pos, rot, _ = pe.pose_error(pose, gt)
     return pos, rot
 
+# ------------------------------------------------------------------ Global initialisation
+SEARCH_SCALES = (0.75, 0.87, 1.0, 1.15, 1.3)    # covers 7–23 m from rings at 8/15/22 m
+SEARCH_DOWNSAMPLE = 2                            # search at half resolution 
+SEARCH_PAD = 150                                 # px of tau-padding so border-cut silhouettes can match
+
+
+def build_ref_db(V, F, K, ref_poses, shape=(960, 1280)):
+    """Project the mesh at every reference pose once: outline points relative to the silhouette centroid."""
+    db = []
+    for frame, ref in sorted(ref_poses.items()):
+        R, C = ref["R_world2cv"], ref["C"]
+        mask = project_mask(V, F, R, -R @ C, K, shape)
+        cs = outline(mask)
+        if not cs:
+            continue
+        m = cv2.moments(mask, binaryImage=True)
+        centroid = np.array([m["m10"] / m["m00"], m["m01"] / m["m00"]])
+        pts = np.vstack(cs).reshape(-1, 2).astype(float)
+        db.append(dict(frame=frame, R=R, C=C, centroid=centroid, rel_pts=pts - centroid))
+    return db
+
+
+def _template(rel_pts, scale, ds):
+    """1-px outline template at scale/ds. Returns (template, centroid position inside it, n points)."""
+    p = np.unique(np.round(rel_pts * scale / ds).astype(int), axis=0)
+    origin = p.min(axis=0)
+    p -= origin
+    tmpl = np.zeros((p[:, 1].max() + 1, p[:, 0].max() + 1), np.float32)
+    tmpl[p[:, 1], p[:, 0]] = 1.0
+    return tmpl, -origin, len(p)
+
+
+def search_refs(dt_obs, ref_db, scales=SEARCH_SCALES, ds=SEARCH_DOWNSAMPLE, pad=SEARCH_PAD):
+    """Chamfer template search over the whole image: best (scale, centroid) per reference, best first."""
+    tau = float(dt_obs.max())
+    small = cv2.resize(dt_obs, None, fx=1 / ds, fy=1 / ds, interpolation=cv2.INTER_AREA)
+    b = pad // ds
+    small = cv2.copyMakeBorder(small, b, b, b, b, cv2.BORDER_CONSTANT, value=tau)
+    out = []
+    for ref in ref_db:
+        best = None
+        for s in scales:
+            tmpl, c_in, n = _template(ref["rel_pts"], s, ds)
+            if tmpl.shape[0] >= small.shape[0] or tmpl.shape[1] >= small.shape[1]:
+                continue
+            res = cv2.matchTemplate(small, tmpl, cv2.TM_CCORR) / n          # mean chamfer at every offset
+            score, _, loc, _ = cv2.minMaxLoc(res)
+            if best is None or score < best["score"]:
+                centroid = (np.array(loc) + c_in) * ds - pad              # back to full-res image coords
+                best = dict(ref=ref, scale=s, score=score, centroid=centroid)
+        if best:
+            out.append(best)
+    return sorted(out, key=lambda c: c["score"])
+
+
+def _rotate_ray(K, px_from, px_to):
+    """Camera rotation that turns the viewing ray of pixel px_from onto the ray of px_to."""
+    Kinv = np.linalg.inv(K)
+    a = Kinv @ np.array([*px_from, 1.0])
+    b = Kinv @ np.array([*px_to, 1.0])
+    a, b = a / np.linalg.norm(a), b / np.linalg.norm(b)
+    axis = np.cross(a, b)
+    s = np.linalg.norm(axis)
+    return np.eye(3) if s < 1e-12 else cv2.Rodrigues(axis / s * np.arctan2(s, a @ b))[0]
+
+
+def start_pose(cand, K, L):
+    """Reference pose -> start pose: range scaled by 1/scale, camera turned onto the found centroid."""
+    ref, s = cand["ref"], cand["scale"]
+    C = L + (ref["C"] - L) / s                      # bigger silhouette (s > 1) -> closer camera
+    R = _rotate_ray(K, ref["centroid"], cand["centroid"]) @ ref["R"]
+    return R, C
+
+
+def localise_silhouette(V, F, K, ref_db, obs_edges, k=3, lam=0.0, levels=LEVELS):
+    """Full silhouette localisation: global search -> k starts -> coarse level each -> refine the best."""
+    L = V.mean(axis=0)
+    cands = search_refs(dist_map(obs_edges, levels[1][0]), ref_db)[:k]
+    coarse = []
+    for cand in cands:
+        R0, C0 = start_pose(cand, K, L)
+        R, C, fun, n = refine(V, F, K, R0, C0, obs_edges, lam, levels=levels[:1])
+        coarse.append(dict(cost=fun, R=R, C=C, cand=cand, start=(R0, C0), nfev=n))
+    best = min(coarse, key=lambda c: c["cost"])
+    R, C, fun, n = refine(V, F, K, best["R"], best["C"], obs_edges, lam, levels=levels[1:])
+    return R, C, fun, dict(ref_frame=best["cand"]["ref"]["frame"], scale=best["cand"]["scale"],
+                           start=best["start"], nfev=sum(c["nfev"] for c in coarse) + n)
 
 # if __name__ == "__main__":
 #     mesh = SIL_MESH_PATH if SIL_MESH_PATH.exists() else MESH_PATH
