@@ -1,0 +1,5 @@
+scene,obs,n,flip180_tie_pct,alias90_tie_pct,ratio180_med,ratio90_med,truth_drift_cm_med
+v1,edges,100,27.0,2.0,1.22,2.2,11.66
+v1,oracle,100,16.0,0.0,2.91,8.63,7.98
+v2,edges,100,8.0,1.0,2.04,2.84,8.76
+v2,oracle,100,17.0,0.0,2.44,8.87,7.14

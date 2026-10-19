@@ -9,9 +9,10 @@ import shutil
 import csv
 import time
 import pandas as pd
+import os
 
 ##setup
-SCENE = "v1"
+SCENE = os.environ.get("SCENE", "v2")
 
 ROOT = Path(__file__).resolve().parent.parent / f"render_output_{SCENE}"
 REF_DIR = ROOT / "TRAINING"
@@ -249,7 +250,7 @@ def save_results(results):
     out_path = RESULTS_DIR / f"pnp_results_{SCENE}_{time.strftime('%Y%m%d_%H%M')}.csv"
     fields = ["test_frame", "method", "success", "ref_frame", "gt_range", "gt_azimuth",
               "n_matches", "n_lifted", "n_inliers", "reproj_px",
-              "pos_err_m", "rot_err_deg", "est_x", "est_y", "est_z", "runtime_s"]
+              "pos_err_m", "rot_err_deg", "est_x", "est_y", "est_z", "est_rx", "est_ry", "est_rz", "runtime_s"]
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -474,7 +475,8 @@ def main():
                 row.update(success=True, ref_frame=pose["ref_frame"], n_matches=pose["n_matches"],
                            n_lifted=pose["n_lifted"], n_inliers=pose["inliers"],
                            reproj_px=pose["reproj_px"], pos_err_m=pos_err, rot_err_deg=rot_err,
-                           est_x=C_est[0], est_y=C_est[1], est_z=C_est[2])
+                           est_x=C_est[0], est_y=C_est[1], est_z=C_est[2],
+                           est_rx=float(pose["rvec"][0, 0]), est_ry=float(pose["rvec"][1, 0]), est_rz=float(pose["rvec"][2, 0]))
                 print(f"  {method:9s} ref {pose['ref_frame']:3d}  inliers {pose['inliers']:4d}/{pose['n_lifted']:4d}  "
                       f"pos {pos_err:.3f} m  rot {rot_err:.2f} deg  reproj {pose['reproj_px']:.2f}px  {runtime:.2f}s")
 

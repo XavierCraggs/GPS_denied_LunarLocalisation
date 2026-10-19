@@ -1,0 +1,42 @@
+
+=== silhouette failure cause (search = truth fits >5% better than the answer) ===
+cause         objective  ok  search  tie
+scene obs                               
+v1    edges           7  49      41    3
+      oracle          2  77      14    7
+v2    edges           6  35      52    7
+      oracle          3  89       7    1
+
+=== symmetry ambiguity (ratio = symmetric-pose cost / truth cost; <1.05 = can't tell apart) ===
+                n  flip180_tie_pct  alias90_tie_pct  ratio180_med  ratio90_med  truth_drift_cm_med
+scene obs                                                                                         
+v1    edges   100             27.0              2.0          1.22         2.20               11.66
+      oracle  100             16.0              0.0          2.91         8.63                7.98
+v2    edges   100              8.0              1.0          2.04         2.84                8.76
+      oracle  100             17.0              0.0          2.44         8.87                7.14
+
+=== hybrid: PnP start -> silhouette polish (accuracy on frames both got right) ===
+                            pnp_success_pct  hybrid_success_pct  rescued  broken  n_both  pos_med_cm_pnp  pos_med_cm_hyb   pos_p  rot_med_pnp  rot_med_hyb   rot_p  n_pnp_bad  flag_auc  start_cost_med_good  start_cost_med_bad
+scene method                                                                                                                                                                                                                    
+v1    AKAZE+SIL-edges                  81.0                79.0        1       3      78          8.4549         10.6973  0.0140       0.3190       0.3446  0.6811          7    0.9136               0.6625              1.2031
+      AKAZE+SIL-oracle                 81.0                87.0        6       0      81          8.7214          6.7709  0.0180       0.3351       0.1618  0.0000          7    0.9295               0.5292              1.4839
+      LightGlue+SIL-edges              95.0                90.0        0       5      90          5.2361         10.2313  0.0000       0.2241       0.2921  0.0000          5    0.7063               0.5733              0.7958
+      LightGlue+SIL-oracle             95.0                97.0        2       0      95          5.3182          7.4792  0.0011       0.2268       0.1495  0.0000          5    0.7421               0.4833              0.6900
+      ORB+SIL-edges                    97.0                94.0        2       5      92          4.7994          9.4431  0.0002       0.2267       0.2970  0.1095          3    0.9759               0.6325              1.2474
+      ORB+SIL-oracle                   97.0                99.0        2       0      97          4.8510          7.1950  0.9727       0.2465       0.1526  0.0000          3    0.9966               0.4625              1.6765
+v2    AKAZE+SIL-edges                  82.0                81.0        3       4      78          7.8584          7.0553  0.3686       0.3305       0.2770  0.4625          7    0.8841               0.6542              1.0115
+      AKAZE+SIL-oracle                 82.0                88.0        6       0      82          8.1617          7.0252  0.0054       0.3312       0.1694  0.0000          7    0.9321               0.5062              1.0091
+      LightGlue+SIL-edges              94.0                92.0        2       4      90          5.1382          7.5206  0.0018       0.1976       0.3004  0.0001          6    0.9131               0.6179              0.9904
+      LightGlue+SIL-oracle             94.0                96.0        2       0      94          5.8404          7.2218  0.0419       0.2059       0.1693  0.0006          6    0.9814               0.4479              0.8908
+      ORB+SIL-edges                    90.0                93.0        4       1      89          6.8779          8.2915  0.2528       0.3095       0.3235  0.1296          9    0.9235               0.6554              1.1691
+      ORB+SIL-oracle                   90.0                98.0        8       0      90          6.9059          6.7445  0.1028       0.3072       0.1531  0.0000          9    0.9568               0.4833              0.9292
+
+=== symmetry check: full localisation vs + best of 90/180/270 alternatives ===
+                        n  base_success_pct  sym_success_pct  rescued  broken  mcnemar_p  switched  runtime_base_s  runtime_sym_s
+scene method                                                                                                                     
+v1    SIL-edge+sym    100              49.0             35.0        3      17     0.0026        45         53.6890       127.1973
+      SIL-oracle+sym  100              77.0             69.0        7      15     0.1338        23         57.4118       134.6939
+v2    SIL-edge+sym    100              35.0             33.0        2       4     0.6875        34         49.9943       120.2180
+      SIL-oracle+sym  100              89.0             68.0        3      24     0.0000        31         55.8601       133.8141
+
+Tables -> C:\Users\xavec\EGH490-2\GPS_denied_LunarLocalisation\analysis

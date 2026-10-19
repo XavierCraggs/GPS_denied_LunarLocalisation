@@ -1,0 +1,5 @@
+scene,method,n,base_success_pct,sym_success_pct,rescued,broken,mcnemar_p,switched,runtime_base_s,runtime_sym_s
+v1,SIL-edge+sym,100,49.0,35.0,3,17,0.0026,45,53.689,127.1973
+v1,SIL-oracle+sym,100,77.0,69.0,7,15,0.1338,23,57.4118,134.6939
+v2,SIL-edge+sym,100,35.0,33.0,2,4,0.6875,34,49.9943,120.218
+v2,SIL-oracle+sym,100,89.0,68.0,3,24,0.0,31,55.8601,133.8141
